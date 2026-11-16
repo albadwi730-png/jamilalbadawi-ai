@@ -1,6 +1,6 @@
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, gte, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
-import { InsertUser, PaymentRequest, User, Wallet, creditTransactions, paymentRequests, plans, users, wallets } from "../drizzle/schema";
+import { InsertUser, PaymentRequest, User, Wallet, assets, creditTransactions, generationJobs, paymentRequests, plans, users, wallets } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -45,6 +45,14 @@ export async function getUserByOpenId(openId: string): Promise<User | undefined>
   return result[0];
 }
 
+export async function recordCompletedGeneration(input: { userId: number; tool: string; costCredits?: number; resultUrl: string; assetName: string; assetKind: string; mimeType?: string; sizeBytes?: number }) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const job = await db.insert(generationJobs).values({ userId: input.userId, tool: input.tool, status: "completed", costCredits: input.costCredits ?? 0, progress: 100, resultUrl: input.resultUrl, completedAt: new Date() });
+  const asset = await db.insert(assets).values({ userId: input.userId, kind: input.assetKind, name: input.assetName, storageKey: input.resultUrl, storageUrl: input.resultUrl, mimeType: input.mimeType, sizeBytes: input.sizeBytes ?? 0 });
+  return { jobId: Number(job[0].insertId), assetId: Number(asset[0].insertId) };
+}
+
 export async function getOrCreateWallet(userId: number): Promise<Wallet> {
   const db = await getDb();
   if (!db) return { id: 0, userId, freeCredits: 0, purchasedCredits: 0, usedCredits: 0, updatedAt: new Date() };
@@ -72,9 +80,52 @@ export async function addCredits(userId: number, amount: number, kind: "grant" |
   });
 }
 
+
+export async function deductCredits(userId: number, amount: number, reason: string, idempotencyKey: string) {
+  if (!Number.isInteger(amount) || amount <= 0) throw new Error("Credit amount must be a positive integer");
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  return db.transaction(async tx => {
+    const duplicate = await tx.select().from(creditTransactions).where(eq(creditTransactions.idempotencyKey, idempotencyKey)).limit(1);
+    if (duplicate[0]) return duplicate[0];
+    const walletRows = await tx.select().from(wallets).where(eq(wallets.userId, userId)).limit(1);
+    const wallet = walletRows[0];
+    if (!wallet) throw new Error("Wallet not found");
+    const balance = wallet.freeCredits + wallet.purchasedCredits - wallet.usedCredits;
+    if (balance < amount) throw new Error("الرصيد غير كافٍ");
+    const updated = await tx.update(wallets).set({ usedCredits: sql`${wallets.usedCredits} + ${amount}`, updatedAt: new Date() }).where(and(eq(wallets.id, wallet.id), gte(sql`${wallets.freeCredits} + ${wallets.purchasedCredits} - ${wallets.usedCredits}`, amount)));
+    if (!updated[0] || updated[0].affectedRows !== 1) throw new Error("تعذر حجز الرصيد؛ أعد المحاولة");
+    const inserted = await tx.insert(creditTransactions).values({ userId, walletId: wallet.id, kind: "usage", amount: -amount, balanceAfter: balance - amount, reason, idempotencyKey });
+    const rows = await tx.select().from(creditTransactions).where(eq(creditTransactions.id, Number(inserted[0].insertId))).limit(1);
+    return rows[0];
+  });
+}
+
+export async function refundCredits(userId: number, amount: number, reason: string, idempotencyKey: string) {
+  if (!Number.isInteger(amount) || amount <= 0) throw new Error("Credit amount must be a positive integer");
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  return db.transaction(async tx => {
+    const duplicate = await tx.select().from(creditTransactions).where(eq(creditTransactions.idempotencyKey, idempotencyKey)).limit(1);
+    if (duplicate[0]) return duplicate[0];
+    const walletRows = await tx.select().from(wallets).where(eq(wallets.userId, userId)).limit(1);
+    const wallet = walletRows[0];
+    if (!wallet || wallet.usedCredits < amount) throw new Error("لا يمكن إرجاع الرصيد المطلوب");
+    await tx.update(wallets).set({ usedCredits: sql`${wallets.usedCredits} - ${amount}`, updatedAt: new Date() }).where(eq(wallets.id, wallet.id));
+    const inserted = await tx.insert(creditTransactions).values({ userId, walletId: wallet.id, kind: "refund", amount, balanceAfter: wallet.freeCredits + wallet.purchasedCredits - wallet.usedCredits + amount, reason, idempotencyKey });
+    const rows = await tx.select().from(creditTransactions).where(eq(creditTransactions.id, Number(inserted[0].insertId))).limit(1);
+    return rows[0];
+  });
+}
+
 export async function createPaymentRequest(input: { userId: number; planId?: number; method: string; amountYer: number; receiptUrl?: string; reference?: string }) {
   const db = await getDb();
   if (!db) throw new Error("Database is not available");
+  if (input.receiptUrl || input.reference) {
+    const value = input.receiptUrl ?? input.reference;
+    const duplicate = await db.select().from(paymentRequests).where(sql`${input.receiptUrl ? paymentRequests.receiptUrl : paymentRequests.reference} = ${value}`).limit(1);
+    if (duplicate[0]) throw new Error("تم تسجيل هذا الإيصال أو الرقم المرجعي من قبل");
+  }
   const inserted = await db.insert(paymentRequests).values({ ...input, status: "pending_review" });
   const rows = await db.select().from(paymentRequests).where(eq(paymentRequests.id, Number(inserted[0].insertId))).limit(1);
   return rows[0];
