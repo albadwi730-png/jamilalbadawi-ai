@@ -3,6 +3,7 @@ import { COOKIE_NAME } from "@shared/const";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { generateImage, listImageModels } from "./_core/imageGeneration";
 import { transcribeAudio } from "./_core/voiceTranscription";
+import { storageGetSignedUrl, storagePut } from "./storage";
 import { systemRouter } from "./_core/systemRouter";
 import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
 import { addCredits, createPaymentRequest, getDashboardSummary, getOrCreateWallet, listPaymentRequests, reviewPaymentRequest } from "./db";
@@ -50,6 +51,22 @@ export const appRouter = router({
         const result = await transcribeAudio(input);
         if ("error" in result) throw new Error(result.error);
         return result;
+      }),
+    transcribeUpload: protectedProcedure
+      .input(z.object({
+        fileName: z.string().min(1).max(180),
+        mimeType: z.string().min(3).max(120),
+        base64: z.string().min(100).max(140_000_000),
+        language: z.string().optional(),
+      }))
+      .mutation(async ({ ctx, input }) => {
+        const bytes = Buffer.from(input.base64, "base64");
+        if (bytes.length > 100 * 1024 * 1024) throw new Error("حجم الملف يتجاوز 100MB");
+        const stored = await storagePut(`uploads/${ctx.user.id}/${Date.now()}-${input.fileName}`, bytes, input.mimeType);
+        const signedUrl = await storageGetSignedUrl(stored.key);
+        const result = await transcribeAudio({ audioUrl: signedUrl, language: input.language });
+        if ("error" in result) throw new Error(result.error);
+        return { ...result, assetUrl: stored.url, status: "completed" as const };
       }),
   }),
 });
